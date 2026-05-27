@@ -2,22 +2,25 @@ import os
 import time
 import streamlit as st
 from pathlib import Path
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from openai import OpenAI
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHROMA_FOLDER = "chroma_db"
-EMBED_MODEL   = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+CHROMA_FOLDER  = "chroma_db"
+DOCS_FOLDER    = "docs"
+EMBED_MODEL    = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 SAMPLE_QUESTIONS = [
-    "How does a black hole form?",
     "What is photosynthesis?",
     "How does DNA replication work?",
     "What is the speed of light?",
-    "What are the unsolved mysteries of the universe?",
-    "How does the human brain work?",
+    "What are acids and bases?",
+    "How do chemical reactions work?",
+    "What is the periodic table?",
 ]
 
 # ── Page setup ───────────────────────────────────────────────────────────────
@@ -39,16 +42,32 @@ st.markdown("""
 st.markdown('<div class="big-title">🔭 SciSnapster AI</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Ask anything about science — powered by real documents</div>', unsafe_allow_html=True)
 
-# ── Load DB ──────────────────────────────────────────────────────────────────
+# ── Auto-index if no DB exists ───────────────────────────────────────────────
 @st.cache_resource
 def load_db():
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-    db = Chroma(persist_directory=CHROMA_FOLDER, embedding_function=embeddings)
-    return db
 
-if not Path(CHROMA_FOLDER).exists():
-    st.error("❌ No database found. Run `python rag.py --index` first!")
-    st.stop()
+    if not Path(CHROMA_FOLDER).exists():
+        pdfs = list(Path(DOCS_FOLDER).glob("*.pdf"))
+        if not pdfs:
+            st.error("❌ No PDFs found in docs/ folder!")
+            st.stop()
+
+        with st.spinner(f"📄 Indexing {len(pdfs)} document(s) for the first time... this takes a few minutes!"):
+            docs = []
+            for pdf in pdfs:
+                loader = PyPDFLoader(str(pdf))
+                docs.extend(loader.load())
+
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            chunks = splitter.split_documents(docs)
+
+            db = Chroma.from_documents(chunks, embeddings, persist_directory=CHROMA_FOLDER)
+        st.success("✅ Documents indexed! Ask away.")
+    else:
+        db = Chroma(persist_directory=CHROMA_FOLDER, embedding_function=embeddings)
+
+    return db
 
 db = load_db()
 
@@ -75,8 +94,8 @@ for msg in st.session_state.messages:
             st.markdown(f'<div class="source-box">📄 Sources: {msg["sources"]}</div>', unsafe_allow_html=True)
 
 # ── Input ────────────────────────────────────────────────────────────────────
-prefill = st.session_state.pop("prefill", "")
-question = st.chat_input("Ask a science question...", )
+prefill  = st.session_state.pop("prefill", "")
+question = st.chat_input("Ask a science question...")
 
 if prefill and not question:
     question = prefill
@@ -88,9 +107,9 @@ if question:
 
     with st.chat_message("assistant"):
         with st.spinner("Searching documents..."):
-            results = db.similarity_search(question, k=4)
-            context = "\n\n".join([r.page_content for r in results])
-            sources = list(set([Path(r.metadata.get("source", "unknown")).name for r in results]))
+            results  = db.similarity_search(question, k=4)
+            context  = "\n\n".join([r.page_content for r in results])
+            sources  = list(set([Path(r.metadata.get("source", "unknown")).name for r in results]))
 
             prompt = f"""You are SciSnapster AI — an enthusiastic, energetic science assistant for the SciSnapster YouTube channel.
 Answer the question based ONLY on the provided science documents.
@@ -107,6 +126,7 @@ Question: {question}
 Answer:"""
 
             client = OpenAI(api_key=OPENROUTER_KEY, base_url="https://openrouter.ai/api/v1")
+            answer = "⚠️ AI is busy right now. Please try again in a moment!"
 
             for attempt in range(4):
                 try:
@@ -116,11 +136,9 @@ Answer:"""
                     )
                     answer = response.choices[0].message.content
                     break
-                except Exception as e:
+                except Exception:
                     if attempt < 3:
                         time.sleep(5)
-                    else:
-                        answer = "⚠️ AI is busy right now. Please try again in a moment!"
 
         st.markdown(answer)
         sources_str = ", ".join(sources)
